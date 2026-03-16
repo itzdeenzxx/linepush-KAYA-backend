@@ -4,8 +4,14 @@ from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI
 
 from app.config import init_firebase
+from app.messages import pick_random_phrase
 from app.services.firestore_service import get_all_active_users, get_eligible_users
-from app.services.line_service import build_exercise_flex_message, send_push_message
+from app.services.line_service import (
+    build_audio_message,
+    build_personalized_flex,
+    send_push_message,
+)
+from app.services.voice_service import generate_audio
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,39 +30,52 @@ def on_startup() -> None:
     logger.info("Application started")
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 @app.get("/")
 def health_check():
     return {"status": "ok"}
 
 
+def _send_to_user(user: dict, current_hour: int) -> bool:
+    """Build personalized flex + voice and send to one user."""
+    user_id = user["user_id"]
+    nickname = user["nickname"]
+    speaker = user["speaker"]
+
+    # 1) Build flex message
+    flex_msg = build_personalized_flex(nickname, speaker, current_hour)
+
+    # 2) Generate voice
+    voice_text = pick_random_phrase(speaker, nickname)
+    audio_url = generate_audio(voice_text, speaker)
+
+    # 3) Assemble messages
+    messages = [flex_msg]
+    if audio_url:
+        messages.append(build_audio_message(audio_url))
+
+    # 4) Send
+    return send_push_message(user_id, messages)
+
+
 @app.get("/send-line-notifications")
 def send_line_notifications():
-
+    """Cron endpoint: send to users whose notifyHour matches current Bangkok hour."""
     now_bangkok = datetime.now(BANGKOK_TZ)
     current_hour = now_bangkok.hour
 
-    logger.info(
-        "Cron triggered — Bangkok time: %s, current_hour: %d",
-        now_bangkok.isoformat(),
-        current_hour,
-    )
+    logger.info("Cron triggered — Bangkok time: %s, hour: %d", now_bangkok.isoformat(), current_hour)
 
     try:
         eligible_users = get_eligible_users(current_hour)
     except Exception:
-        logger.exception("Failed to fetch eligible users from Firestore")
+        logger.exception("Failed to fetch eligible users")
         return {"success": False, "error": "Failed to read user settings"}
 
     sent = 0
     failed = 0
 
     for user in eligible_users:
-        user_id = user["user_id"]
-        ok = send_push_message(user_id, [build_exercise_flex_message()])
-        if ok:
+        if _send_to_user(user, current_hour):
             sent += 1
         else:
             failed += 1
@@ -75,23 +94,23 @@ def send_line_notifications():
 
 @app.get("/force-send")
 def force_send():
+    """Force send to ALL active users immediately (ignores notifyHour)."""
     now_bangkok = datetime.now(BANGKOK_TZ)
+    current_hour = now_bangkok.hour
 
     logger.info("Force send triggered — Bangkok time: %s", now_bangkok.isoformat())
 
     try:
         active_users = get_all_active_users()
     except Exception:
-        logger.exception("Failed to fetch active users from Firestore")
+        logger.exception("Failed to fetch active users")
         return {"success": False, "error": "Failed to read user settings"}
 
     sent = 0
     failed = 0
 
     for user in active_users:
-        user_id = user["user_id"]
-        ok = send_push_message(user_id, [build_exercise_flex_message()])
-        if ok:
+        if _send_to_user(user, current_hour):
             sent += 1
         else:
             failed += 1
